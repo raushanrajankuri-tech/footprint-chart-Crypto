@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Binance Clean Footprint Chart</title>
+    <style>
+        body {
+            margin: 0;
+            background-color: #0b0e14;
+            color: #d1d4dc;
+            font-family: 'Consolas', monospace;
+            overflow: hidden;
+            user-select: none;
+        }
+        #topbar {
+            height: 44px;
+            background: #131722;
+            border-bottom: 1px solid #222631;
+            display: flex;
+            align-items: center;
+            padding: 0 15px;
+            gap: 15px;
+            font-size: 13px;
+        }
+        .price-live {
+            font-size: 16px;
+            font-weight: bold;
+            color: #00e676;
+        }
+        select, button {
+            background: #1e222d;
+            color: #fff;
+            border: 1px solid #363c4e;
+            padding: 4px 10px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 12px;
+        }
+        select:hover, button:hover {
+            border-color: #f0b90b;
+        }
+        #status {
+            margin-left: auto;
+            font-size: 12px;
+            color: #00e676;
+            font-weight: bold;
+        }
+        canvas {
+            display: block;
+            cursor: grab;
+        }
+        canvas:active {
+            cursor: grabbing;
+        }
+    </style>
+</head>
+<body>
+
+<div id="topbar">
+    <span style="color:#f0b90b; font-weight:bold;">● BINANCE FOOTPRINT</span>
+    
+    <select id="symbolSelect" onchange="changeSettings()">
+        <option value="BTCUSDT" data-step="10">BTC/USDT (Row: $10)</option>
+        <option value="BTCUSDT" data-step="25">BTC/USDT (Row: $25)</option>
+        <option value="BTCUSDT" data-step="50">BTC/USDT (Row: $50)</option>
+        <option value="ETHUSDT" data-step="1">ETH/USDT (Row: $1)</option>
+        <option value="ETHUSDT" data-step="2">ETH/USDT (Row: $2)</option>
+        <option value="PAXGUSDT" data-step="1">GOLD - PAXG/USDT (Row: $1)</option>
+        <option value="SOLUSDT" data-step="0.2">SOL/USDT (Row: $0.2)</option>
+    </select>
+
+    <select id="tfSelect" onchange="changeSettings()">
+        <option value="60">1m Candle</option>
+        <option value="300">5m Candle</option>
+        <option value="900" selected>15m Candle</option>
+    </select>
+
+    <div>Price: <span id="livePrice" class="price-live">Loading...</span></div>
+    <div>Candle Δ: <span id="liveDelta">0</span></div>
+    <div>CVD: <span id="liveCVD">0</span></div>
+    <button onclick="priceOffset = 0">Center Price</button>
+    <div id="status">Connecting...</div>
+</div>
+
+<canvas id="chartCanvas"></canvas>
+
+<script>
+const canvas = document.getElementById('chartCanvas');
+const ctx = canvas.getContext('2d');
+
+let ws = null;
+let pollTimer = null;
+let symbol = 'BTCUSDT';
+let rowSize = 10;
+let timeframe = 900; // 15m default
+let currentPrice = 0;
+let cumulativeDelta = 0;
+let candles = [];
+let priceOffset = 0;
+let visibleRows = 22;
+let lastTradeId = 0;
+let statusLog = "Loading historical candles from Binance...";
+
+const BINANCE_MIRRORS = [
+    "https://data-api.binance.vision",
+    "https://api.binance.me",
+    "https://api1.binance.com",
+    "https://api3.binance.com"
+];
+let activeMirror = BINANCE_MIRRORS[0];
+
+function resizeCanvas() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight - 44;
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+// Mouse Dragging Up/Down
+let isDragging = false;
+let startY = 0;
+canvas.addEventListener('mousedown', (e) => { isDragging = true; startY = e.clientY; });
+window.addEventListener('mouseup', () => { isDragging = false; });
+window.addEventListener('mousemove', (e) => {
+    if (!isDragging) return;
+    const diff = e.clientY - startY;
+    if (Math.abs(diff) > 14) {
+        priceOffset += Math.sign(diff) * rowSize;
+        startY = e.clientY;
+    }
+});
+
+// Mouse Wheel Zoom
+canvas.addEventListener('wheel', (e) => {
+    e.preventDefault();
+    if (e.deltaY < 0) visibleRows = Math.max(12, visibleRows - 2);
+    else visibleRows = Math.min(42, visibleRows + 2);
+});
+
+function formatVol(num) {
+    const abs = Math.abs(num);
+    if (abs >= 1000000) return (num / 1000000).toFixed(2) + 'M';
+    if (abs >= 1000) return (num / 1000).toFixed(1) + 'K';
+    return num.toFixed(0);
+}
+
+function createNewCandle(timestamp, openPrice, highPrice, lowPrice, closePrice) {
+    return {
+        time: timestamp,
+        open: openPrice,
+        high: highPrice,
+        low: lowPrice,
+        close: closePrice,
+        totalVol: 0,
+        delta: 0,
+        cvd: cumulativeDelta,
+        poc: null,
+        levels: {}
+    };
+}
+
+async function loadHistoricalCandles() {
+    const tfMap = { 60: '1m', 300: '5m', 900: '15m' };
+    const interval = tfMap[timeframe] || '15m';
+
+    for (const base of BINANCE_MIRRORS) {
+        try {
+            const res = await fetch(`${base}/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=5`);
+            if (!res.ok) continue;
+            activeMirror = base;
+            const klines = await res.json();
+
+            candles = [];
+            cumulativeDelta = 0;
+
+            for (let i = 0; i < klines.length; i++) {
+                const k = klines[i];
+                const startTimeMs = k[0];
+                const endTimeMs = k[6];
+                const candleTimeSec = Math.floor(startTimeMs / 1000);
+                const open = parseFloat(k[1]);
+                const high = parseFloat(k[2]);
+                const low = parseFloat(k[3]);
+                const close = parseFloat(k[4]);
+
+                const c = createNewCandle(candleTimeSec, open, high, low, close);
+                candles.push(c);
+                currentPrice = close;
+
+                try {
+                    const trRes = await fetch(`${base}/api/v3/aggTrades?symbol=${symbol}&startTime=${startTimeMs}&endTime=${endTimeMs}&limit=1000`);
+                    if (trRes.ok) {
+                        const trades = await trRes.json();
+                        trades.forEach(t => {
+                            if (t.a > lastTradeId) lastTradeId = t.a;
+                            addTradeToCandle(c, parseFloat(t.p), parseFloat(t.q), t.m);
+                        });
+                    }
+                } catch (e) {}
+            }
+
+            const latestRes = await fetch(`${base}/api/v3/aggTrades?symbol=${symbol}&limit=1000`);
+            if (latestRes.ok) {
+                const latestTrades = await latestRes.json();
+                latestTrades.forEach(t => {
+                    if (t.a > lastTradeId) {
+                        lastTradeId = t.a;
+                        processLiveTrade(parseFloat(t.p), parseFloat(t.q), t.m, t.T);
+                    }
+                });
+            }
+
+            updateTopMetrics();
+            document.getElementById('status').innerText = '● BINANCE LIVE (CONNECTED)';
+            document.getElementById('status').style.color = '#00e676';
+            return true;
+        } catch (e) {}
+    }
+    return false;
+}
+
+function addTradeToCandle(candle, price, qty, isSell) {
+    const usdVol = price * qty;
+    candle.high = Math.max(candle.high, price);
+    candle.low = Math.min(candle.low, price);
+    candle.close = price;
+
+    const levelPrice = (Math.floor(price / rowSize) * rowSize).toFixed(2);
+    if (!candle.levels[levelPrice]) {
+        candle.levels[levelPrice] = { bid: 0, ask: 0 };
+    }
+
+    if (isSell) {
+        candle.levels[levelPrice].bid += usdVol;
+        candle.delta -= usdVol;
+        cumulativeDelta -= usdVol;
+    } else {
+        candle.levels[levelPrice].ask += usdVol;
+        candle.delta += usdVol;
+        cumulativeDelta += usdVol;
+    }
+
+    candle.totalVol += usdVol;
+    candle.cvd = cumulativeDelta;
+}
+
+function processLiveTrade(price, qty, isSell, tradeTimeMs) {
+    const tradeTime = Math.floor(tradeTimeMs / 1000);
+    const candleStart = Math.floor(tradeTime / timeframe) * timeframe;
+
+    currentPrice = price;
+
+    let candle = candles[candles.length - 1];
+    if (!candle || candleStart > candle.time) {
+        candle = createNewCandle(candleStart, price, price, price, price);
+        candles.push(candle);
+        if (candles.length > 5) candles.shift();
+    }
+
+    addTradeToCandle(candle, price, qty, isSell);
+    updateTopMetrics();
+}
+
+function updateTopMetrics() {
+    if (candles.length === 0) return;
+    const c = candles[candles.length - 1];
+
+    document.getElementById('livePrice').innerText = currentPrice.toFixed(2);
+
+    const dEl = document.getElementById('liveDelta');
+    dEl.innerText = (c.delta >= 0 ? '+' : '') + formatVol(c.delta);
+    dEl.style.color = c.delta >= 0 ? '#00e676' : '#ff5252';
+
+    const cEl = document.getElementById('liveCVD');
+    cEl.innerText = (cumulativeDelta >= 0 ? '+' : '') + formatVol(cumulativeDelta);
+    cEl.style.color = cumulativeDelta >= 0 ? '#00e676' : '#ff5252';
+}
+
+async function pollLatestTrades() {
+    try {
+        const res = await fetch(`${activeMirror}/api/v3/aggTrades?symbol=${symbol}&limit=80`);
+        if (res.ok) {
+            const data = await res.json();
+            data.forEach(t => {
+                if (t.a > lastTradeId) {
+                    lastTradeId = t.a;
+                    processLiveTrade(parseFloat(t.p), parseFloat(t.q), t.m, t.T);
+                }
+            });
+        }
+    } catch (e) {}
+}
+
+function startEngine() {
+    if (ws) ws.close();
+    if (pollTimer) clearInterval(pollTimer);
+    candles = [];
+    cumulativeDelta = 0;
+    priceOffset = 0;
+    lastTradeId = 0;
+
+    document.getElementById('status').innerText = 'Loading...';
+    document.getElementById('status').style.color = '#f0b90b';
+
+    loadHistoricalCandles();
+
+    try {
+        ws = new WebSocket(`wss://data-stream.binance.vision:9443/ws/${symbol.toLowerCase()}@aggTrade`);
+        ws.onmessage = (ev) => {
+            const d = JSON.parse(ev.data);
+            if (d.a && d.a > lastTradeId) {
+                lastTradeId = d.a;
+                processLiveTrade(parseFloat(d.p), parseFloat(d.q), d.m, d.T);
+            }
+        };
+    } catch (e) {}
+
+    pollTimer = setInterval(pollLatestTrades, 1200);
+}
+
+function changeSettings() {
+    const symEl = document.getElementById('symbolSelect');
+    symbol = symEl.value;
+    rowSize = parseFloat(symEl.options[symEl.selectedIndex].getAttribute('data-step'));
+    timeframe = parseInt(document.getElementById('tfSelect').value);
+    startEngine();
+}
+
+function drawChart() {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    const footerHeight = 115; // Clean compact bottom table height
+    const chartHeight = canvas.height - footerHeight;
+    const rightAxisWidth = 90;
+    const chartWidth = canvas.width - rightAxisWidth;
+
+    if (candles.length === 0 || currentPrice === 0) {
+        ctx.fillStyle = '#f0b90b';
+        ctx.font = '15px Consolas';
+        ctx.fillText(statusLog, canvas.width / 2 - 170, chartHeight / 2);
+        requestAnimationFrame(drawChart);
+        return;
+    }
+
+    const rowHeight = chartHeight / visibleRows;
+    const centerLevel = (Math.floor(currentPrice / rowSize) * rowSize) + priceOffset;
+    const topLevel = centerLevel + Math.floor(visibleRows / 2) * rowSize;
+
+    // 1. Horizontal Grid & Right Price Axis
+    ctx.font = '12px Consolas';
+    for (let i = 0; i < visibleRows; i++) {
+        const lvlNum = topLevel - i * rowSize;
+        const lvl = lvlNum.toFixed(2);
+        const y = i * rowHeight;
+
+        ctx.strokeStyle = '#151924';
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(chartWidth, y);
+        ctx.stroke();
+
+        const isCurrent = Math.abs((Math.floor(currentPrice / rowSize) * rowSize) - lvlNum) < 0.001;
+        if (isCurrent) {
+            ctx.fillStyle = '#f0b90b';
+            ctx.fillRect(chartWidth + 2, y + 2, rightAxisWidth - 4, rowHeight - 4);
+            ctx.fillStyle = '#000';
+            ctx.font = 'bold 12px Consolas';
+        } else {
+            ctx.fillStyle = '#787b86';
+            ctx.font = '12px Consolas';
+        }
+        ctx.textAlign = 'left';
+        ctx.fillText(lvl, chartWidth + 8, y + rowHeight / 1.5);
+    }
+
+    let maxCandleVol = 1;
+    candles.forEach(c => { if (c.totalVol > maxCandleVol) maxCandleVol = c.totalVol; });
+
+    // 2. Draw Footprint Columns
+    const colWidth = (chartWidth - 65) / Math.max(candles.length, 5);
+
+    candles.forEach((c, idx) => {
+        const colX = 60 + idx * colWidth;
+        const centerX = colX + colWidth / 2;
+
+        ctx.strokeStyle = '#151924';
+        ctx.beginPath();
+        ctx.moveTo(colX, 0);
+        ctx.lineTo(colX, chartHeight);
+        ctx.stroke();
+
+        let maxLevelVol = 1;
+        let pocLevel = null;
+        for (const [lvl, data] of Object.entries(c.levels)) {
+            const tot = data.bid + data.ask;
+            if (tot > maxLevelVol) {
+                maxLevelVol = tot;
+                pocLevel = lvl;
+            }
+        }
+        c.poc = pocLevel;
+
+        const highY = ((topLevel - Math.floor(c.high / rowSize) * rowSize) / rowSize) * rowHeight;
+        const lowY = ((topLevel - Math.floor(c.low / rowSize) * rowSize) / rowSize) * rowHeight + rowHeight;
+        ctx.fillStyle = c.close >= c.open ? '#00e676' : '#ff5252';
+        ctx.fillRect(colX + 4, highY, 4, Math.max(4, lowY - highY));
+
+        for (let i = 0; i < visibleRows; i++) {
+            const lvl = (topLevel - i * rowSize).toFixed(2);
+            const y = i * rowHeight;
+            const cell = c.levels[lvl];
+
+            if (cell) {
+                const maxBarW = (colWidth / 2) - 14;
+                const bidW = (cell.bid / maxLevelVol) * maxBarW;
+                const askW = (cell.ask / maxLevelVol) * maxBarW;
+
+                ctx.fillStyle = '#121620';
+                ctx.fillRect(colX + 10, y + 1, colWidth - 14, rowHeight - 2);
+
+                ctx.fillStyle = 'rgba(239, 83, 80, 0.45)';
+                ctx.fillRect(centerX - bidW - 1, y + 2, bidW, rowHeight - 4);
+
+                ctx.fillStyle = 'rgba(0, 230, 118, 0.55)';
+                ctx.fillRect(centerX + 1, y + 2, askW, rowHeight - 4);
+
+                if (lvl === pocLevel) {
+                    ctx.strokeStyle = '#ffd600';
+                    ctx.lineWidth = 1.5;
+                    ctx.strokeRect(colX + 10, y + 1, colWidth - 14, rowHeight - 2);
+                    ctx.lineWidth = 1;
+                }
+
+                const buyImb = cell.ask >= cell.bid * 3 && cell.ask > 8000;
+                const sellImb = cell.bid >= cell.ask * 3 && cell.bid > 8000;
+
+                ctx.font = sellImb ? 'bold 11px Consolas' : '11px Consolas';
+                ctx.fillStyle = sellImb ? '#ffeb3b' : '#ef9a9a';
+                ctx.textAlign = 'right';
+                ctx.fillText(formatVol(cell.bid), centerX - 5, y + rowHeight - 6);
+
+                ctx.font = buyImb ? 'bold 11px Consolas' : '11px Consolas';
+                ctx.fillStyle = buyImb ? '#00ff88' : '#a5d6a7';
+                ctx.textAlign = 'left';
+                ctx.fillText(formatVol(cell.ask), centerX + 5, y + rowHeight - 6);
+            }
+        }
+
+        // 3. Bottom Summary Table (Volume, Delta, Delta %, Cum Delta, Time)
+        const tableY = chartHeight + 10;
+        const deltaPct = c.totalVol > 0 ? ((c.delta / c.totalVol) * 100).toFixed(0) + '%' : '0%';
+        const isPos = c.delta >= 0;
+
+        ctx.fillStyle = isPos ? 'rgba(0, 230, 118, 0.15)' : 'rgba(255, 82, 82, 0.15)';
+        ctx.fillRect(colX + 6, tableY + 18, colWidth - 12, 36);
+
+        ctx.textAlign = 'center';
+        ctx.font = '12px Consolas';
+
+        ctx.fillStyle = '#fff';
+        ctx.fillText(formatVol(c.totalVol), centerX, tableY + 13);
+
+        ctx.fillStyle = isPos ? '#00e676' : '#ff5252';
+        ctx.fillText((isPos ? '+' : '') + formatVol(c.delta), centerX, tableY + 31);
+        ctx.fillText((isPos ? '+' : '') + deltaPct, centerX, tableY + 49);
+
+        ctx.fillStyle = c.cvd >= 0 ? '#00e676' : '#ff5252';
+        ctx.fillText((c.cvd >= 0 ? '+' : '') + formatVol(c.cvd), centerX, tableY + 68);
+
+        const timeStr = new Date(c.time * 1000).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'});
+        ctx.fillStyle = '#787b86';
+        ctx.fillText(timeStr, centerX, tableY + 88);
+    });
+
+    // Footer Left Labels
+    const lblX = 6;
+    const tableY = chartHeight + 10;
+    ctx.textAlign = 'left';
+    ctx.font = '12px Consolas';
+    ctx.fillStyle = '#787b86';
+    ctx.fillText('Volume', lblX, tableY + 13);
+    ctx.fillText('Delta', lblX, tableY + 31);
+    ctx.fillText('Delta %', lblX, tableY + 49);
+    ctx.fillText('Cum Δ', lblX, tableY + 68);
+    ctx.fillText('Time', lblX, tableY + 88);
+
+    ctx.strokeStyle = '#2a2e39';
+    ctx.beginPath();
+    ctx.moveTo(0, chartHeight);
+    ctx.lineTo(canvas.width, chartHeight);
+    ctx.stroke();
+
+    requestAnimationFrame(drawChart);
+}
+
+startEngine();
+drawChart();
+</script>
+</body>
+</html>
